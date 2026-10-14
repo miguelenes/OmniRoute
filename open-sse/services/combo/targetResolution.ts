@@ -81,26 +81,23 @@ import {
 import {
   applySessionStickiness,
   clearStickyBindingsForCombo,
+  deriveMessageHash,
   normalizeStickinessMessages,
+  peekStickyConnectionId,
   resolveDisableSessionStickiness,
   type ApplyStickinessResult,
 } from "./sessionStickiness.ts";
+import { createHash } from "node:crypto";
 import { applyRequestTagRouting } from "./autoStrategy.ts";
 import {
   extractPromptForJevState,
   orderJevComboTargets,
-  type JevAsk,
   type JevOrderOutcome,
 } from "./jevOrdering.ts";
 import { partitionJevTargetsForAsk } from "./jevBlockChecker.ts";
 import type { JevPartition } from "./jevEligibility.ts";
 import { recordComboDecision } from "./decisionTrace.ts";
-import {
-  evaluateSystemOneChoice,
-  type SystemOneChoiceUnavailable,
-  TYPESAFE_PROVIDER_ID,
-} from "../typesafe/systemOne.ts";
-import { getProviderCredentials } from "../../../src/sse/services/auth";
+import { createJevAsk, type JevComboConfig } from "./jevAsk.ts";
 import { getStrategyTraits, type StrategyTraits } from "./strategyRegistry.ts";
 import type {
   ComboCollectionLike,
@@ -549,48 +546,23 @@ async function orderByJevStrategy(
 
   const eligible = partition.eligible;
   const sessionPinned = await jevSessionPinned(deps, eligible);
-  const ask: JevAsk = async ({ state, criteria }) => {
-    try {
-      const credentials = await getProviderCredentials(
-        TYPESAFE_PROVIDER_ID,
-        null,
-        deps.apiKeyAllowedConnections ?? null
-      );
-      const apiKey =
-        credentials && typeof (credentials as { apiKey?: unknown }).apiKey === "string"
-          ? (credentials as { apiKey: string }).apiKey
-          : null;
-      const result = await evaluateSystemOneChoice({
-        apiKey,
-        state,
-        criteria,
-        signal,
-      });
-      if (result.ok) {
-        return {
-          ok: true as const,
-          answer: {
-            choice: result.choice,
-            probabilities: result.probabilities,
-            confidence: result.confidence,
-          },
-        };
-      }
-      const unavailable = result as SystemOneChoiceUnavailable;
-      log.info("COMBO", `[jev] System One unavailable: ${unavailable.reason}`);
-      if (unavailable.reason === "missing_api_key") {
-        return { ok: false as const, reason: "missing_api_key" as const };
-      }
-      return { ok: false as const, reason: "unavailable" as const };
-    } catch {
-      log.warn("COMBO", "[jev] System One call failed (non-fatal); falling open to user order");
-      return { ok: false as const, reason: "unavailable" as const };
-    }
-  };
+  const jevConfig = (deps.config as { jev?: JevComboConfig | null | undefined } | null | undefined)
+    ?.jev;
+  const ask = createJevAsk({
+    jevConfig: jevConfig ?? null,
+    log,
+    signal: signal ?? null,
+    apiKeyAllowedConnections: deps.apiKeyAllowedConnections ?? null,
+  });
 
   const outcome = await orderJevComboTargets(eligible, extractPromptForJevState(body), {
     sessionPinned,
     ask,
+    policy: {
+      probabilityFloor: jevConfig?.probabilityFloor,
+      confidenceFloor: jevConfig?.confidenceFloor,
+      maxAdmitted: jevConfig?.maxAdmitted,
+    },
   });
 
   recordJevOrderingOutcome(deps.traceInvocationId, outcome, log);
@@ -681,7 +653,17 @@ function logJevOrderingSummary({
   );
 }
 
-/** True when continuity will pin this combo. Uses the same stickiness pass the pipeline runs again. */
+/**
+ * True when continuity will pin this combo. Read-only: derives the
+ * stickiness key and peeks the binding without running the gates
+ * (saturation / connection health / quota exhaustion) that the real
+ * `applySessionStickiness` pass runs inside `applyContinuityFilters`.
+ *
+ * Running the full pass here would (a) double the cost of every jev
+ * request and (b) race with the real pass — a transient gate in the
+ * preview could clear a binding the real pass then misses, silently
+ * dropping a still-healthy pin.
+ */
 async function jevSessionPinned(
   deps: ResolveComboTargetPipelineDeps,
   targets: ResolvedComboTarget[]
@@ -692,12 +674,18 @@ async function jevSessionPinned(
       deps.settings as Record<string, unknown> | null | undefined
     ) === true;
   if (disableSessionStickiness || targets.length <= 1) return false;
-  const stickyPreview = await applySessionStickiness(
-    targets,
-    normalizeStickinessMessages(deps.body as { messages?: unknown; input?: unknown }),
-    deps.combo.name
-  );
-  return stickyPreview.stuck;
+  const messages = normalizeStickinessMessages(deps.body as { messages?: unknown; input?: unknown });
+  const rawHash = deriveMessageHash(messages);
+  if (!rawHash) return false;
+  const messageHash = createHash("sha256")
+    .update(deps.combo.name)
+    .update("\0")
+    .update(rawHash)
+    .digest("hex")
+    .slice(0, 16);
+  const pinnedId = peekStickyConnectionId(messageHash);
+  if (!pinnedId) return false;
+  return targets.some((target) => target.connectionId === pinnedId);
 }
 
 /**

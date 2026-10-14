@@ -16,6 +16,7 @@ import {
   type JevCandidate,
   type JevChoiceAnswer,
   type JevHoldReason,
+  type JevPolicy,
   type JudgeJevResult,
 } from "./jevStrategy.ts";
 import { TYPESAFE_MAX_CHOICE_OPTIONS, TYPESAFE_MAX_STATE_CHARS } from "../typesafe/systemOne.ts";
@@ -51,6 +52,13 @@ async function requestJevAnswer(
     return { answer: null, missingApiKey: false };
   }
 }
+
+/** Per-combo overrides for the judge. Absent fields fall back to module constants. */
+export type JevOrderOptions = {
+  sessionPinned: boolean;
+  ask: JevAsk;
+  policy?: JevPolicy;
+};
 
 export type JevHoldRecord = {
   executionKey: string;
@@ -109,6 +117,10 @@ function toTextContent(content: unknown): string {
  * Latest user text only — never the tool transcript or system prompts.
  * Chat Completions: last `messages` entry with role user.
  * Responses API: last `input` item with role user (not a join of the whole array).
+ *
+ * Privacy: this is the only state forwarded to the System One judge. The
+ * narrow scope is what makes a local decision backend (Ollama Clef / Clef Flash,
+ * Nimble, Tev) safe to run on a host that should not see the full transcript.
  */
 export function extractPromptForJevState(body: Record<string, unknown> | null | undefined): string {
   if (!body || typeof body !== "object") return "";
@@ -142,8 +154,9 @@ function latestResponsesUserInput(input: unknown): string | null {
 export async function orderJevComboTargets(
   targets: readonly ResolvedComboTarget[],
   state: string,
-  ports: { sessionPinned: boolean; ask: JevAsk }
+  options: JevOrderOptions
 ): Promise<JevOrderOutcome> {
+  const ports = options;
   if (ports.sessionPinned || targets.length <= 1) {
     return {
       targets: [...targets],
@@ -165,9 +178,10 @@ export async function orderJevComboTargets(
 
   return toOutcome(
     targets,
-    judgeJev(candidates, answer),
+    judgeJev(candidates, answer, options?.policy ?? {}),
     missingApiKey,
-    answer?.confidence ?? null
+    answer?.confidence ?? null,
+    answer?.model ?? null
   );
 }
 
@@ -177,13 +191,15 @@ function formatAdmittedDetail(
   confidence: number | null,
   fellOpen: boolean,
   fallbackReason: JudgeJevResult["fallbackReason"],
-  missingApiKey: boolean
+  missingApiKey: boolean,
+  model: string | null
 ): string {
   const parts = [`verdict=admitted`, `rank=${userRank}`];
   if (probability !== null && probability !== undefined) parts.push(`p=${probability}`);
   if (confidence !== null && confidence !== undefined && !fellOpen) {
     parts.push(`c=${confidence}`);
   }
+  if (model) parts.push(`model=${model}`);
   if (fellOpen && fallbackReason) parts.push(`fallback=${fallbackReason}`);
   if (missingApiKey) parts.push("Jev is not configured");
   return parts.join(" ");
@@ -203,7 +219,8 @@ function toOutcome(
   targets: readonly ResolvedComboTarget[],
   judged: JudgeJevResult,
   missingApiKey: boolean,
-  confidence: number | null
+  confidence: number | null,
+  answeringModel: string | null
 ): JevOrderOutcome {
   const byId = new Map(targets.map((target) => [target.executionKey, target]));
   const holds: JevHoldRecord[] = [];
@@ -233,7 +250,8 @@ function toOutcome(
         confidence,
         judged.fellOpen,
         judged.fallbackReason,
-        missingApiKey
+        missingApiKey,
+        answeringModel
       ),
     });
   }

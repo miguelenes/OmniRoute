@@ -29,7 +29,15 @@ export type JevChoiceAnswer = {
   choice: string;
   probabilities: Record<string, number>;
   confidence: number;
+  /**
+   * System One model that produced the answer, when the upstream surfaces one
+   * (e.g. `body.model` from `/v1/systemone`). Recorded on the decision-trace
+   * `detail` so an operator can tell which decision backend answered. Null when
+   * the upstream did not report a model or the route-backed backend elides it.
+   */
+  model?: string | null;
 };
+
 
 export type JevVerdictRow = {
   id: string;
@@ -49,6 +57,16 @@ export type JudgeJevResult = {
   fallbackReason: "low_confidence" | "jev_unavailable" | null;
 };
 
+/**
+ * Per-call overrides for the three tunable floors. Module constants are the
+ * defaults so existing callers see no behavior change when they pass nothing.
+ */
+export type JevPolicy = {
+  probabilityFloor?: number;
+  confidenceFloor?: number;
+  maxAdmitted?: number;
+};
+
 function byUserRank(a: { userRank: number }, b: { userRank: number }): number {
   return a.userRank - b.userRank;
 }
@@ -61,7 +79,8 @@ function probabilityFor(answer: JevChoiceAnswer, id: string): number {
 function admitCandidates(
   candidates: readonly JevCandidate[],
   winner: JevCandidate,
-  answer: JevChoiceAnswer
+  answer: JevChoiceAnswer,
+  floors: { probabilityFloor: number; maxAdmitted: number }
 ): Pick<JudgeJevResult, "admitted" | "held"> {
   const admitted: JevVerdictRow[] = [
     {
@@ -76,7 +95,7 @@ function admitCandidates(
   for (const candidate of [...candidates].sort(byUserRank)) {
     if (candidate.id === winner.id) continue;
     const probability = probabilityFor(answer, candidate.id);
-    if (probability < JEV_PROBABILITY_FLOOR) {
+    if (probability < floors.probabilityFloor) {
       held.push({
         id: candidate.id,
         userRank: candidate.userRank,
@@ -86,7 +105,7 @@ function admitCandidates(
       });
       continue;
     }
-    if (admitted.length >= JEV_MAX_ADMITTED) {
+    if (admitted.length >= floors.maxAdmitted) {
       held.push({
         id: candidate.id,
         userRank: candidate.userRank,
@@ -137,8 +156,23 @@ function fallOpen(
  */
 export function judgeJev(
   candidates: readonly JevCandidate[],
-  answer: JevChoiceAnswer | null
+  answer: JevChoiceAnswer | null,
+  policy: JevPolicy = {}
 ): JudgeJevResult {
+  const probabilityFloor =
+    typeof policy.probabilityFloor === "number" && Number.isFinite(policy.probabilityFloor)
+      ? policy.probabilityFloor
+      : JEV_PROBABILITY_FLOOR;
+  const confidenceFloor =
+    typeof policy.confidenceFloor === "number" && Number.isFinite(policy.confidenceFloor)
+      ? policy.confidenceFloor
+      : JEV_CONFIDENCE_FLOOR;
+  const maxAdmitted =
+    typeof policy.maxAdmitted === "number" &&
+    Number.isFinite(policy.maxAdmitted) &&
+    policy.maxAdmitted > 0
+      ? Math.floor(policy.maxAdmitted)
+      : JEV_MAX_ADMITTED;
   if (candidates.length === 0) {
     return { admitted: [], held: [], fellOpen: false, fallbackReason: null };
   }
@@ -165,7 +199,7 @@ export function judgeJev(
     return fallOpen(candidates, "jev_unavailable");
   }
 
-  if (!(answer.confidence >= JEV_CONFIDENCE_FLOOR)) {
+  if (!(answer.confidence >= confidenceFloor)) {
     return fallOpen(candidates, "low_confidence");
   }
 
@@ -179,7 +213,13 @@ export function judgeJev(
     return fallOpen(candidates, "jev_unavailable");
   }
 
-  const { admitted, held } = admitCandidates(candidates, winner, answer);
+  // The winner is admitted unconditionally even when its own probability is
+  // below the probability floor: the model picked it on purpose. Non-winners
+  // below the floor are held; that is the only floor filter applied here.
+  const { admitted, held } = admitCandidates(candidates, winner, answer, {
+    probabilityFloor,
+    maxAdmitted,
+  });
 
   return {
     admitted,
