@@ -16,6 +16,12 @@ import {
   createDirectivePreambleStripper,
   createSystemPreambleStripper,
 } from "../../utils/directivePreambleStripper.ts";
+import {
+  containsOrMayEndWithThinkOpenTag,
+  flushThinkBuffer,
+  initThinkState,
+  processStreamingThinkDelta,
+} from "../../utils/thinkTagParser.ts";
 
 function normalizeToolName(name: string): string {
   return REVERSE_MAP[name] ?? name;
@@ -172,6 +178,71 @@ function extractXmlInvokeBlocks(
   return { cleaned, toolCalls };
 }
 
+// Read the reasoning an upstream sends in a dedicated field: reasoning_content
+// (GLM, DeepSeek, ...), the `reasoning` alias, or reasoning_details[]
+// (StepFun/OpenRouter).
+function readNativeReasoning(delta): unknown {
+  let reasoning = delta?.reasoning_content || delta?.reasoning;
+  if (!reasoning && Array.isArray(delta?.reasoning_details)) {
+    const parts: string[] = [];
+    for (const detail of delta.reasoning_details) {
+      if (detail && typeof detail === "object") {
+        const text = detail.text || detail.content;
+        if (typeof text === "string" && text) parts.push(text);
+      }
+    }
+    if (parts.length > 0) reasoning = parts.join("");
+  }
+  return reasoning;
+}
+
+// Split reasoning that an OpenAI-compatible upstream inlines in `content` as
+// <think>...</think> (DeepSeek-R1 mirrors, QwQ, K3, MiniMax-M3 on OpenAI-format
+// tiers) so it reaches a Claude client as a thinking block instead of raw markup
+// inside a text block. Gated per route by shouldParseTextualReasoningTags (via
+// initThinkState): parsing every provider's content would corrupt legitimate
+// replies that mention a literal <think>. The parser is streaming-safe — a tag
+// split across chunks is held back until it can be decided — so whatever it
+// still holds is flushed when the finish chunk arrives. Returns null when the
+// route is not allowlisted or no tag has been seen, leaving content untouched.
+function splitInlineThinkContent(
+  content: unknown,
+  state,
+  model: unknown,
+  finishing: boolean
+): { content: string; reasoning: string } | null {
+  if (!state.thinkState) {
+    if (typeof content !== "string" || !content) return null;
+    state.thinkState = initThinkState(
+      true,
+      state.provider,
+      typeof model === "string" ? model : undefined
+    );
+  }
+  const ctx = state.thinkState;
+  if (!ctx.enabled) return null;
+
+  let nextContent = "";
+  let reasoning = "";
+  if (typeof content === "string" && content) {
+    if (ctx.active || containsOrMayEndWithThinkOpenTag(content)) {
+      ctx.active = true;
+      const { reasoningDelta, contentDelta } = processStreamingThinkDelta(content, ctx);
+      reasoning += reasoningDelta || "";
+      nextContent += contentDelta || "";
+    } else {
+      nextContent = content;
+    }
+  }
+  if (finishing && ctx.active) {
+    const { reasoningDelta, contentDelta } = flushThinkBuffer(ctx);
+    reasoning += reasoningDelta || "";
+    nextContent += contentDelta || "";
+  }
+  if (!ctx.active) return null;
+  return { content: nextContent, reasoning };
+}
+
 // Helper: stop thinking block if started
 function stopThinkingBlock(state, results) {
   if (!state.thinkingBlockStarted) return;
@@ -249,6 +320,7 @@ function readUsageCounters(usage) {
     cacheCreateTokens: firstNumber(
       promptDetails?.cache_creation_tokens ?? inputDetails?.cache_creation_tokens
     ),
+    writeInPrompt: (promptDetails ?? inputDetails)?.cache_creation_in_prompt !== false,
   };
 }
 
@@ -256,13 +328,14 @@ function readUsageCounters(usage) {
 // usage-only chunks that carry `choices: []` (#11817).
 function trackUsageFromChunk(chunk, state) {
   if (!chunk.usage || typeof chunk.usage !== "object") return;
-  const { promptTokens, outputTokens, cacheReadTokens, cacheCreateTokens } = readUsageCounters(
-    chunk.usage
-  );
+  const { promptTokens, outputTokens, cacheReadTokens, cacheCreateTokens, writeInPrompt } =
+    readUsageCounters(chunk.usage);
 
-  // input_tokens = prompt_tokens - cached_tokens - cache_creation_tokens
-  // Because OpenAI's prompt_tokens includes all prompt-side tokens
-  const inputTokens = promptTokens - cacheReadTokens - cacheCreateTokens;
+  // #2215 reports cache creation outside prompt_tokens.
+  const inputTokens = Math.max(
+    0,
+    promptTokens - cacheReadTokens - (writeInPrompt ? cacheCreateTokens : 0)
+  );
 
   state.usage = {
     input_tokens: inputTokens,
@@ -349,18 +422,24 @@ export function openaiToClaudeResponse(chunk, state) {
     });
   }
 
+  // Inline <think>...</think> in content (allowlisted textual-reasoning routes
+  // only). Runs first so the extracted reasoning flows through the thinking
+  // branch below — same requestedThinking gate and _reasoningAccum — and the
+  // directive/system-preamble strippers only ever see the visible answer.
+  const inlineThink = splitInlineThinkContent(
+    delta?.content,
+    state,
+    chunk?.model || state.model,
+    Boolean(choice.finish_reason) && !state.claudeFinishEmitted
+  );
+  const content = inlineThink ? inlineThink.content : delta?.content;
+
   // Handle reasoning_content (thinking) - GLM, DeepSeek, etc.
   // Also supports 'reasoning' field alias and reasoning_details[] (StepFun/OpenRouter)
-  let reasoningContent = delta?.reasoning_content || delta?.reasoning;
-  if (!reasoningContent && Array.isArray(delta?.reasoning_details)) {
-    const parts: string[] = [];
-    for (const detail of delta.reasoning_details) {
-      if (detail && typeof detail === "object") {
-        const text = detail.text || detail.content;
-        if (typeof text === "string" && text) parts.push(text);
-      }
-    }
-    if (parts.length > 0) reasoningContent = parts.join("");
+  let reasoningContent = readNativeReasoning(delta);
+  if (inlineThink?.reasoning) {
+    reasoningContent =
+      (typeof reasoningContent === "string" ? reasoningContent : "") + inlineThink.reasoning;
   }
   const hasReasoning =
     typeof reasoningContent === "string" &&
@@ -405,12 +484,31 @@ export function openaiToClaudeResponse(chunk, state) {
     state._reasoningAccum = (state._reasoningAccum || "") + reasoningContent;
   }
 
+  // Refusal text is literal output, never input for XML/DSML tool-call shims.
+  if (typeof delta?.refusal === "string" && delta.refusal) {
+    if (!state.textBlockStarted) {
+      state.textBlockIndex = state.nextBlockIndex++;
+      state.textBlockStarted = true;
+      state.textBlockClosed = false;
+      results.push({
+        type: "content_block_start",
+        index: state.textBlockIndex,
+        content_block: { type: "text", text: "" },
+      });
+    }
+    results.push({
+      type: "content_block_delta",
+      index: state.textBlockIndex,
+      delta: { type: "text_delta", text: delta.refusal },
+    });
+  }
+
   // Handle regular content — strip the internal reasoning placeholder if
   // the model echoed it through ordinary content (#8081). Only the content
   // block emission is skipped when nothing meaningful remains; the chunk
   // may still carry tool_calls / finish_reason below, which must still run.
-  if (delta?.content) {
-    const strippedContent = stripInternalReasoningPlaceholder(delta.content);
+  if (content) {
+    const strippedContent = stripInternalReasoningPlaceholder(content);
     if (strippedContent) {
       // #reasoning-bilingual response side: DeepSeek-V4 and similar models echo the
       // OMNIROUTE_SYSTEM_INSTRUCTION_APPEND directive (appended to the system tail by

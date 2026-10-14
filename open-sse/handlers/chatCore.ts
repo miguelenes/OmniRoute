@@ -1,3 +1,4 @@
+import { learnCopilotModelRejection } from "../services/copilotModelRejections.ts";
 import {
   extractRequestToolMetadata,
   resolveResponseToolNameMap,
@@ -123,7 +124,7 @@ import { createPreparedRequestLogger } from "../utils/providerRequestLogging.ts"
 import { summarizeToolSources } from "../utils/toolSources.ts";
 import { applyResponsesPreviousResponseIdPolicy } from "../utils/responsesStatePolicy.ts";
 import { applyClaudeEffortVariant } from "./chatCore/claudeEffortVariant.ts";
-import { DEFAULT_THINKING_CLAUDE_SIGNATURE } from "../config/defaultThinkingSignature.ts";
+import { sanitizeAnthropicPassthroughHistory } from "./chatCore/anthropicPassthroughHistory.ts";
 import {
   getStripTypesForProviderModel,
   stripIncompatibleMessageContent,
@@ -219,6 +220,7 @@ import {
   updatePendingScope,
 } from "@/lib/usage/pendingRequestScope";
 import { recordChatCallCost, buildCostCtx } from "@/domain/costRules";
+import { attachOmniRouteMetaToResponse as attachRouteMeta } from "@/domain/omnirouteResponseMeta";
 import { calculateCost } from "@/lib/usage/costCalculator";
 import { buildClaudePassthroughToolNameMap } from "./chatCore/passthroughToolNames.ts";
 import {
@@ -2381,9 +2383,9 @@ async function handleChatCoreInner({
       // Only Anthropic's first-party API validates these signatures (token-bound); third-party
       // Claude-shape providers do not. See redactPassthroughThinkingSignatures + issue #2454.
       if (provider === "claude") {
-        translatedBody.messages = redactPassthroughThinkingSignatures(
-          translatedBody.messages,
-          DEFAULT_THINKING_CLAUDE_SIGNATURE
+        // Also drops foreign server_tool_use ids (z.ai `call_…`) that fail ^srvtoolu_ (9router#3685).
+        translatedBody.messages = sanitizeAnthropicPassthroughHistory(
+          translatedBody.messages
         ) as typeof translatedBody.messages;
 
         stripClaudeRejectedTopLevelFields(translatedBody, clientRawRequest?.headers);
@@ -3127,12 +3129,13 @@ async function handleChatCoreInner({
         // FIX 5: tag this as a per-API-key token-limit breach (errorCode
         // TOKEN_LIMIT_EXCEEDED) so the combo loop can distinguish it from an
         // upstream 429 and NOT cool shared accounts / retry it transiently.
-        return createErrorResult(
+        const rejected = createErrorResult(
           HTTP_STATUS.RATE_LIMITED,
           `Token limit exceeded for ${scopeLabel}: ${tokenBreach.tokensUsed}/${tokenBreach.limitValue} tokens used in the current window. Please try again later.`,
           null,
           "TOKEN_LIMIT_EXCEEDED"
         );
+        return { ...rejected, response: attachRouteMeta(rejected.response, { provider, model }) };
       }
     } catch (err) {
       // Fail-open at Tier 2: Tier 1 already enforced the model/global limit pre-dispatch.
@@ -3148,12 +3151,13 @@ async function handleChatCoreInner({
     try {
       if (isTpmExhausted(effectiveModel)) {
         trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
-        return createErrorResult(
+        const rejected = createErrorResult(
           HTTP_STATUS.RATE_LIMITED,
           `Gemini TPM rate limit reached for ${effectiveModel}. Please try again later.`,
           null,
           "GEMINI_TPM_EXHAUSTED"
         );
+        return { ...rejected, response: attachRouteMeta(rejected.response, { provider, model }) };
       }
     } catch (err) {
       log?.warn?.("GEMINI_RATE_LIMIT", "Pre-dispatch TPM check failed; allowing request", { err });
@@ -3577,16 +3581,12 @@ async function handleChatCoreInner({
           const notFoundCooldownMs = COOLDOWN_MS.notFound;
           if (!(await shouldIsolateProbeFailures())) {
             const modelToLock = targetModel || model;
-            lockModel(
-              provider,
-              errorConnectionId,
-              modelToLock,
-              "model_not_found",
-              notFoundCooldownMs
-            );
-            console.warn(
-              `[provider] Node ${errorConnectionId} model not found (${statusCode}) for ${modelToLock} - locking model for ${Math.ceil(notFoundCooldownMs / 1000)}s (connection stays active)`
-            );
+            if (!learnCopilotModelRejection(statusCode, provider, errorConnectionId, modelToLock, upstreamErrorBody)) {
+              lockModel(provider, errorConnectionId, modelToLock, "model_not_found", notFoundCooldownMs);
+              console.warn(
+                `[provider] Node ${errorConnectionId} model not found (${statusCode}) for ${modelToLock} - locking model for ${Math.ceil(notFoundCooldownMs / 1000)}s (connection stays active)`
+              );
+            }
           }
         }
       } catch {}

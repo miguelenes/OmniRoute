@@ -386,6 +386,18 @@ export class GrokCliExecutor extends BaseExecutor {
       transformed.tools = stripUnsupportedGrokBuildWebSearchArgs(transformed.tools);
     }
 
+    // Grok Build rejects the Responses named native-tool choice (ModelToolChoice).
+    // "required" is equivalent only when every offered tool is native web search;
+    // with mixed tools it could force an unrelated function instead.
+    if (
+      asRequestRecord(transformed.tool_choice).type === "web_search" &&
+      Array.isArray(transformed.tools) &&
+      transformed.tools.length > 0 &&
+      transformed.tools.every((tool) => asRequestRecord(tool).type === "web_search")
+    ) {
+      transformed.tool_choice = "required";
+    }
+
     // xAI's cli-chat-proxy rejects requests containing more than 200 tools.
     if (Array.isArray(transformed.tools) && transformed.tools.length > GROK_BUILD_MAX_TOOLS) {
       transformed.tools = transformed.tools.slice(0, GROK_BUILD_MAX_TOOLS);

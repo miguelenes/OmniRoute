@@ -237,13 +237,13 @@ function responsesApiOutputHasContent(output: unknown): boolean {
       const content = record.content;
       return (
         Array.isArray(content) &&
-        content.some(
-          (part) =>
-            !!part &&
-            typeof part === "object" &&
-            typeof (part as Record<string, unknown>).text === "string" &&
-            ((part as Record<string, string>).text as string).length > 0
-        )
+        content.some((part) => {
+          if (!isRecord(part)) return false;
+          return (
+            (typeof part.text === "string" && part.text.length > 0) ||
+            (part.type === "refusal" && typeof part.refusal === "string" && part.refusal.length > 0)
+          );
+        })
       );
     })
   );
@@ -352,8 +352,10 @@ export async function validateResponseQuality(
   log: { warn?: (...args: unknown[]) => void },
   responseValidation?: ResponseValidationConfig | null,
   signal?: AbortSignal | null,
-  trustedEmptyTurn = false
+  trustedEmptyTurn: boolean | (() => boolean) = false
 ): Promise<ResponseQualityResult> {
+  const permitsEmptyTurn = () =>
+    typeof trustedEmptyTurn === "function" ? trustedEmptyTurn() : trustedEmptyTurn;
   // Issue #3685: For Claude SSE streaming responses, use a BOUNDED PEEK to
   // detect the empty-content-block pattern (content_filter stop_reason with
   // no content_block_* events) WITHOUT de-streaming non-empty responses.
@@ -622,7 +624,7 @@ export async function validateResponseQuality(
             // response. Require the final message_stop and NO opened blocks:
             // an empty start/stop block (#1382) or content_filter still fails over.
             if (
-              trustedEmptyTurn &&
+              permitsEmptyTurn() &&
               sse.hasMessageStop &&
               !sse.hasContentBlock &&
               (sse.stopReason === "end_turn" || sse.stopReason === "stop_sequence")
@@ -693,6 +695,8 @@ export async function validateResponseQuality(
           // `outcome === "content"` branch above and never reaches here —
           // this branch only fires on genuinely empty completions.
           if (openAi.hasChoicePayload && openAi.hasTerminalMarker) {
+            if (permitsEmptyTurn())
+              return { valid: true, clonedResponse: buildReplayResponse(reader) };
             log.warn?.(
               "COMBO",
               "Streaming OpenAI-shape response reached finish_reason/[DONE] with no content, reasoning, or tool_calls — marking as invalid for combo failover"
@@ -869,7 +873,10 @@ export async function validateResponseQuality(
 
   const choices = json?.choices;
   if (json?.object === "response") {
-    if (!responsesApiOutputHasContent(json.output))
+    if (
+      !responsesApiOutputHasContent(json.output) &&
+      !(json.status === "completed" && permitsEmptyTurn())
+    )
       return { valid: false, reason: "empty_choices" };
     const status = typeof json.status === "string" ? json.status : "";
     // Same terminal set as detectMalformedNonStream (diagnostics.ts). A combo
@@ -943,12 +950,16 @@ export async function validateResponseQuality(
     return { valid: false, reason: specViolation };
   }
 
-  if (!hasContent && !hasToolCalls) {
+  const hasRefusal = typeof message.refusal === "string" && message.refusal.trim().length > 0;
+  if (!hasContent && !hasToolCalls && !hasRefusal) {
     // finish_reason "length" is a truncated completion (max_tokens hit), the
     // same case the Claude shape exempts as stop_reason "max_tokens" (#12968).
     // A thinking model that spends the whole budget before any visible token
     // is a valid response, not a reason to fail the combo target over.
-    if (firstChoice?.finish_reason === "length") {
+    if (
+      firstChoice?.finish_reason === "length" ||
+      (firstChoice?.finish_reason === "stop" && permitsEmptyTurn())
+    ) {
       return {
         valid: true,
         clonedResponse: new Response(text, {

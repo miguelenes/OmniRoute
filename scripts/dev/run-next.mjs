@@ -222,6 +222,11 @@ async function start() {
   const mainServerTimeouts = getMainServerTimeoutConfig();
   server.keepAliveTimeout = mainServerTimeouts.keepAliveTimeoutMs;
   server.headersTimeout = mainServerTimeouts.headersTimeoutMs;
+  if (mainServerTimeouts.tcpKeepAliveInitialDelayMs > 0) {
+    server.on("connection", (socket) => {
+      socket.setKeepAlive(true, mainServerTimeouts.tcpKeepAliveInitialDelayMs);
+    });
+  }
   server.on("upgrade", async (req, socket, head) => {
     try {
       const responsesWsHandled = await responsesWsProxy.handleUpgrade(req, socket, head);

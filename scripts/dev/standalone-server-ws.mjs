@@ -262,6 +262,11 @@ http.createServer = function createServerWithResponsesWs(...args) {
   const mainServerTimeouts = getMainServerTimeoutConfig();
   server.keepAliveTimeout = mainServerTimeouts.keepAliveTimeoutMs;
   server.headersTimeout = mainServerTimeouts.headersTimeoutMs;
+  if (mainServerTimeouts.tcpKeepAliveInitialDelayMs > 0) {
+    server.on("connection", (socket) => {
+      socket.setKeepAlive(true, mainServerTimeouts.tcpKeepAliveInitialDelayMs);
+    });
+  }
   const originalOn = server.on.bind(server);
   const originalAddListener = server.addListener.bind(server);
 

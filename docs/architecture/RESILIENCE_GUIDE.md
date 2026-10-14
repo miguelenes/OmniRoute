@@ -114,6 +114,12 @@ turn. They are still not model output, so a turn that ends with reasoning only i
 reported as empty, and a turn that stops reasoning and only sends heartbeats still trips
 the watchdog.
 
+Kiro's binary `reasoningContentEvent` frames with a non-empty signature preserve this
+reasoning activity through the executor as an empty `reasoning_content` delta. The signature is
+not forwarded. Metadata, incomplete frames and empty signatures do not restart the
+content budget; the independent active-stream timeout and client cancellation still
+apply (`open-sse/executors/kiro/reasoning.ts`).
+
 **Terminal states (NOT cooldowns):**
 
 - `banned` — set by banned-keyword / account-ban detection (see [BAN_DETECTION](../security/BAN_DETECTION.md)), and by three consecutive upstream per-request refusals (`request_rejected`, e.g. Anthropic OAuth 403 "Request not allowed" — `open-sse/services/requestRejectedStreak.ts`); a single refusal only cools the connection down
@@ -426,6 +432,15 @@ on multi-model combos, e.g. both targets of a 2-model combo hitting a per-model
 rate limit. Bounded by `comboCooldownWait` (`enabled`, `maxWaitMs`, `maxAttempts`,
 `budgetMs`) in **Settings → Resilience**. It never waits on `quota_exhausted`
 (locked until midnight) or auth/not-found reasons.
+
+The same gate covers the pre-dispatch case (#16319): when every target of a
+combo is skipped before any attempt is made because its model sits in a short
+transient lockout, the zero-attempt path waits the lock out under the same
+ceilings and re-dispatches, instead of answering a hint-less
+`503 ALL_TARGETS_SKIPPED`. When no wait is allowed (ceiling, attempt or budget
+exhausted, or the feature off), the terminal response upgrades to
+`429 rate_limit_error` carrying `retry_after` / `reset_at` from the earliest
+transient lock expiry; quota, auth and not-found locks keep the hint-less 503.
 
 ---
 

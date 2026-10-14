@@ -86,6 +86,24 @@ Flow:
 Forced modes short-circuit **before** the auto heuristic runs; `auto` behavior
 is byte-identical to the pre-PR-1 guardrail.
 
+#### API-key scope (`visionBridgeKeyScope.ts`)
+
+When the caller's API key restricts `allowedConnections`, quota pools
+(`allowedQuotas`) or models (`allowedModels` / `blockedModels` /
+`modelAccessMode: "restricted"` / `disableNonPublicModels`), the bridge only
+picks reroute and describe models the key may use, on connections the key may
+use. The describe call then always goes through the OmniRoute self-loop with
+the `x-omniroute-self-loop-key-id` header, so the receiving chat request
+enforces that key's connection and model policy again. `enforceApiKeyPolicy()`
+honors that header only together with the self-loop bearer, so it can only
+narrow access, and an id that does not resolve is rejected.
+
+If no vision model is permitted for the key, the describe path steps aside and
+the request passes through unchanged, the same fail-open behavior as a disabled
+guardrail (meta `{ skipped: true, reason: "no_permitted_vision_model" }`).
+Requests without a key, and keys without these restrictions, behave exactly as
+before.
+
 #### Task-aware describe prompt (`modalityBridgeVisionTaskAware`)
 
 Default **true**. `composeVisionPrompt()` (`visionBridgeHelpers.ts`) appends
@@ -494,6 +512,8 @@ after system-prompt/handoff/memory injection reshapes the message array. The
 body sent upstream to the model is unchanged. An observed request also populates
 no durable Memory (both request- and response-derived extraction are skipped),
 so the model's own reply cannot echo transcript text into Memory.
+
+**Raw video fields (#12430).** When the bridge is enabled and native video support is unknown or absent, defined `transcript`/`audioTranscript` fields also activate `videoBridgeObserved`, even after description failure or a `maxVideos` limit. `null` and empty strings count; absent fields and non-video metadata do not. Retained copies redact these fields or omit the request, and caches/Memory are bypassed. The provider payload stays unchanged.
 
 Additional retained copies use the same observed-request signal. The raw
 pre-guardrail client-request snapshot, in-memory pending request, and early

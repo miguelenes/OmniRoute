@@ -40,6 +40,7 @@ import {
 import {
   resolveComboCooldownWaitDecision,
   resolveCircuitOpenWaitDecision,
+  isTransientComboCooldownReason,
   type ResolveComboCooldownDecisionResult,
 } from "./comboCooldownRetry.ts";
 import {
@@ -62,6 +63,7 @@ import { collectCircuitOpenExclusions, evaluateExecuteTargetGates } from "./exec
 import { executeTargetAttempt } from "./executeTargetAttempt.ts";
 import { buildComboDiag } from "./executeTargetClassify.ts";
 import type { AttemptLoopDeps, AttemptLoopState, ExecuteTargetResult } from "./attemptLoopTypes.ts";
+import { getStrategyTraits } from "./strategyRegistry.ts";
 
 /** A second in-flight copy of a body larger than this sits in the TLS send buffer. */
 const HEDGE_MAX_BODY_BYTES = 256 * 1024;
@@ -137,6 +139,47 @@ async function computeEarliestSkippedRateLimitedUntil(
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolve the earliest TRANSIENT model-lockout expiry across the skipped
+ * targets (#16319). `computeEarliestSkippedRateLimitedUntil` only reads
+ * connection-level `rateLimitedUntil`, so a model-scoped cooldown never
+ * surfaced a recovery hint: a single-target combo whose only model sat in a
+ * short lock answered a hint-less 503 the client reads as an outage. Only
+ * reasons the cooldown-wait helper classifies as transient qualify — a
+ * `quota_exhausted` lock runs to midnight and auth/not-found locks never
+ * clear on their own, so neither may advertise a retry-after. Best-effort by
+ * design, like its connection-level sibling: terminal error construction must
+ * never become a new failure.
+ */
+async function computeEarliestSkippedModelLockUntil(
+  orderedTargets: AttemptLoopState["orderedTargets"]
+): Promise<string | null> {
+  try {
+    let earliestMs: number | null = null;
+    for (const target of orderedTargets) {
+      const provider = typeof target?.provider === "string" ? target.provider : "";
+      if (!provider) continue;
+      const connectionId = typeof target?.connectionId === "string" ? target.connectionId : "";
+      const rawModel = parseModel(target?.modelStr ?? "").model || "";
+      if (!rawModel) continue;
+      const info = getModelLockoutInfo(provider, connectionId, rawModel);
+      if (!info || !isTransientComboCooldownReason(info.reason)) continue;
+      if (typeof info.remainingMs !== "number" || !(info.remainingMs > 0)) continue;
+      const untilMs = Date.now() + info.remainingMs;
+      if (earliestMs === null || untilMs < earliestMs) earliestMs = untilMs;
+    }
+    return earliestMs === null ? null : new Date(earliestMs).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+/** Earliest of two optional ISO instants (null-safe). */
+function earliestIsoInstant(a: string | null, b: string | null): string | null {
+  if (a && b) return Date.parse(a) <= Date.parse(b) ? a : b;
+  return a || b;
 }
 
 export type DispatchWithCooldownRetryExtra = {
@@ -276,7 +319,7 @@ export async function dispatchWithCooldownRetry(opts: {
       // and a slow upstream holds both copies for the whole headers wait.
       const bodySmallEnoughToHedge = isBodySmallEnoughToHedge(deps.body);
       const hasProtectedPriorityTarget =
-        deps.strategy === "priority" &&
+        getStrategyTraits(deps.strategy).honorsFallbackOnlyTargets &&
         state.orderedTargets.some((target) => target.fallbackOnlyOnQuotaExhaustion === true);
 
       const executeTarget = async (i: number): Promise<ExecuteTargetResult> => {
@@ -525,6 +568,42 @@ export async function dispatchWithCooldownRetry(opts: {
           );
           return dispatchWithCooldownRetry({ state, deps, extra });
         }
+        // #16319: a model-scoped cooldown is not a circuit-open skip. With zero
+        // dispatched attempts nothing populates state.earliestRetryAfter, so the
+        // general cooldown wait below never runs and a single-target combo
+        // crystallized a hint-less 503 while the lock had seconds left. Ask the
+        // same helper the post-dispatch path uses — it derives the wait from each
+        // target's own lock and rejects quota/auth/not-found reasons — and
+        // re-dispatch when a SHORT transient lock is about to clear.
+        const modelLockWait = resolveComboCooldownWaitDecision({
+          targets: state.orderedTargets,
+          earliestRetryAfter: null,
+          attempt: extra.comboCooldownAttempt.current,
+          budgetLeftMs: extra.comboCooldownBudgetLeftMs.current,
+          settings: deps.resilienceSettings.comboCooldownWait,
+          lookupLock: (provider, connectionId, target) => {
+            const rawModel = parseModel(target?.modelStr ?? "").model || "";
+            if (!rawModel) return null;
+            return getModelLockoutInfo(provider, connectionId, rawModel);
+          },
+          computeWaitMs: () => null,
+        });
+        if (modelLockWait.wait) {
+          deps.log.info(
+            "COMBO",
+            `${deps.strategy} model-lock wait: waiting ${Math.ceil(modelLockWait.waitMs / 1000)}s (reason=${modelLockWait.reason ?? "model_lockout"}) then retrying (attempt ${extra.comboCooldownAttempt.current + 1}/${deps.resilienceSettings.comboCooldownWait.maxAttempts})`
+          );
+          const completed = await waitForCooldownAwareRetry(modelLockWait.waitMs, deps.signal);
+          if (!completed) {
+            return errorResponse(499, "Request aborted");
+          }
+          extra.comboCooldownAttempt.current += 1;
+          extra.comboCooldownBudgetLeftMs.current = Math.max(
+            0,
+            extra.comboCooldownBudgetLeftMs.current - modelLockWait.waitMs
+          );
+          return dispatchWithCooldownRetry({ state, deps, extra });
+        }
       }
 
       // All set retries exhausted — return the final error
@@ -558,8 +637,11 @@ export async function dispatchWithCooldownRetry(opts: {
           const quotaSkip = formatQuotaSkipMessage(
             collectQuotaWindowExclusions(state.orderedTargets)
           );
-          const skippedRateLimitedUntil = await computeEarliestSkippedRateLimitedUntil(
-            state.orderedTargets
+          // #16319: the connection-level scan misses model-scoped cooldowns —
+          // fold the earliest transient model-lock expiry into the same hint.
+          const skippedRateLimitedUntil = earliestIsoInstant(
+            await computeEarliestSkippedRateLimitedUntil(state.orderedTargets),
+            await computeEarliestSkippedModelLockUntil(state.orderedTargets)
           );
           const retryHuman = skippedRateLimitedUntil
             ? formatRetryAfter(toRetryAfterDisplayValue(skippedRateLimitedUntil))

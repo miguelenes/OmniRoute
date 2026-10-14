@@ -260,6 +260,14 @@ export function syncSkillsBeta(
  * inline-tools beta gates message-level `tool_addition` blocks; without it
  * upstream rejects the body with a 400 whose message reads
  * "`tool_addition` blocks require anthropic-beta".
+ *
+ * `server-side-fallback-2026-06-01` and `server-side-fallback-2026-07-01` gate the top-level
+ * `fallbacks` body parameter (server-side model fallback) that Claude Code sends by default on
+ * the models that support it, captured from @anthropic-ai/claude-code@2.1.295
+ * (`R("server_side_fallback","server-side-fallback-2026-06-01")` and
+ * `R("server_side_fallback_category","server-side-fallback-2026-07-01")` in the shipped binary).
+ * The `fallbacks` field travels through the passthrough; without its beta upstream rejects the
+ * body with `400 fallbacks: Extra inputs are not permitted`.
  */
 export const FORWARDABLE_CLIENT_BETAS = Object.freeze([
   "tool-search-tool-2025-10-19",
@@ -286,6 +294,11 @@ export const FORWARDABLE_CLIENT_BETAS = Object.freeze([
   // @anthropic-ai/claude-code@2.1.291 (`v("message_threads","message-threads-2026-08-12")`).
   // The body field passes through; without this beta upstream 400s "thread: Extra inputs".
   "message-threads-2026-08-12",
+  // Top-level `fallbacks` (server-side model fallback), captured from
+  // @anthropic-ai/claude-code@2.1.295 — see the doc comment above. The body field passes through;
+  // without these betas upstream 400s "fallbacks: Extra inputs are not permitted".
+  "server-side-fallback-2026-06-01",
+  "server-side-fallback-2026-07-01",
 ]);
 
 /**

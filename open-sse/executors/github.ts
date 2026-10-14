@@ -8,6 +8,7 @@ import {
 } from "./base.ts";
 import { PROVIDERS, OAUTH_ENDPOINTS } from "../config/constants.ts";
 import { getModelTargetFormat } from "../config/providerModels.ts";
+import { containsMediaKind } from "../utils/mediaParts.ts";
 import {
   getGitHubCopilotChatHeaders,
   getGitHubCopilotRefreshHeaders,
@@ -327,7 +328,9 @@ export class GithubExecutor extends BaseExecutor {
     credentials: ProviderCredentials,
     stream = true,
     clientHeaders?: Record<string, string> | null,
-    model?: string
+    model?: string,
+    _health?: unknown,
+    body?: unknown
   ): Record<string, string> {
     const token = this.getCopilotToken(credentials) || credentials.accessToken;
     const initiator = this.resolveInitiatorHeader(clientHeaders);
@@ -380,9 +383,16 @@ export class GithubExecutor extends BaseExecutor {
     // /v1/messages proxy returns an empty content block for image turns unless
     // copilot-vision-request:true is present; a Copilot-aware harness that sends
     // it should have it honored rather than stripped.
+    // Also set it ourselves when the turn carries an image (chat
+    // `messages` or Responses `input`), so plain OpenAI-SDK clients get vision too.
+    const turns = (body as { messages?: unknown; input?: unknown } | null | undefined) || {};
+    const bodyHasImage =
+      containsMediaKind(turns.messages as Parameters<typeof containsMediaKind>[0], "image") ||
+      containsMediaKind(turns.input as Parameters<typeof containsMediaKind>[0], "image");
     if (
+      bodyHasImage ||
       (this.readClientHeader(clientHeaders, "copilot-vision-request") || "").toLowerCase() ===
-      "true"
+        "true"
     ) {
       headers["copilot-vision-request"] = "true";
     }

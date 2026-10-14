@@ -64,6 +64,12 @@ export interface RegistryModel {
    */
   alwaysReasons?: boolean;
   supportedThinkingEfforts?: readonly string[];
+  /**
+   * Effort suffixes that must fold onto this base model even when the live
+   * catalog lists `<id>-<effort>` as its own model. Use only when that catalog
+   * id is a different billed SKU, not the reasoning tier clients expect.
+   */
+  effortSuffixesThatFoldDespiteLiveCatalog?: readonly string[];
   supportsVision?: boolean;
   supportsAudio?: boolean;
   supportsVideo?: boolean;
